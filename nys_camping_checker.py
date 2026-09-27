@@ -1,8 +1,12 @@
 import argparse
 import json
+import os
+import smtplib
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from urllib.parse import urlencode
 
 import requests
@@ -18,6 +22,10 @@ REQUEST_TIMEOUT_SECONDS = 15
 MAX_PAGES = 20  # safety cap; a park would need 400+ sites to exceed this
 MIN_MONITOR_INTERVAL_SECONDS = 60
 ALERT_SOUND_PATH = "/System/Library/Sounds/Glass.aiff"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_ENV_SENDER = "CAMPING_ALERT_EMAIL"
+EMAIL_ENV_APP_PASSWORD = "CAMPING_ALERT_APP_PASSWORD"
 
 _last_request_time = None
 
@@ -178,13 +186,55 @@ def _play_alert_sound():
         print("Warning: could not play alert sound (afplay not found - are you on macOS?)")
 
 
-def monitor_availability(park_id, start_date, nights, interval, sound=False):
+def _email_body(result, sites):
+    """Build the plaintext body for a new-opening email alert."""
+    url = _booking_url(result["park_id"], result["start_date"], result["nights"])
+    lines = [f"New opening(s) found at park {result['park_id']}:", ""]
+    for site in sites:
+        lines.append(f"  Site {site['site']}  (Loop: {site['loop']}, {site['site_type']})")
+    lines += [
+        "",
+        f"Dates: {result['start_date']} to {result['end_date']} "
+        f"({result['nights']} night{'s' if result['nights'] != 1 else ''})",
+        "",
+        f"Book here: {url}",
+    ]
+    return "\n".join(lines)
+
+
+def _send_email_alert(sender, app_password, recipient, park_id, body):
+    """Email a new-opening alert via Gmail SMTP. Never raises - logs and returns."""
+    msg = MIMEText(body)
+    msg["Subject"] = f"Campsite opened: Park {park_id}"
+    msg["From"] = sender
+    msg["To"] = recipient
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=REQUEST_TIMEOUT_SECONDS) as server:
+            server.starttls()
+            server.login(sender, app_password)
+            server.sendmail(sender, [recipient], msg.as_string())
+    except Exception as exc:
+        print(f"Warning: failed to send email alert: {exc}")
+
+
+def monitor_availability(
+    park_id,
+    start_date,
+    nights,
+    interval,
+    sound=False,
+    email_sender=None,
+    email_app_password=None,
+    email_recipient=None,
+):
     """Poll check_availability() in a loop, alerting only on newly opened sites.
 
     Runs until interrupted with Ctrl+C. Sleeps ``interval`` seconds between
     checks; the existing per-request throttle inside check_availability()
     still applies within each check. If ``sound`` is set, also plays the
-    macOS alert sound whenever a new opening is found.
+    macOS alert sound whenever a new opening is found. If ``email_sender`` is
+    set, also emails ``email_recipient`` whenever a new opening is found.
     """
     print(
         f"Monitoring park {park_id}: {start_date} for {nights} night"
@@ -212,6 +262,14 @@ def monitor_availability(park_id, start_date, nights, interval, sound=False):
                     _print_notification(result, sites=new_sites)
                     if sound:
                         _play_alert_sound()
+                    if email_sender:
+                        _send_email_alert(
+                            email_sender,
+                            email_app_password,
+                            email_recipient,
+                            park_id,
+                            _email_body(result, new_sites),
+                        )
                 else:
                     print(f"[{timestamp}] Checked — no new openings")
 
@@ -275,11 +333,46 @@ def main():
             "opening (requires --monitor)"
         ),
     )
+    parser.add_argument(
+        "--email",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ADDRESS",
+        help=(
+            "In --monitor mode, also email ADDRESS on a new opening (requires "
+            "--monitor; defaults to the sender address if ADDRESS is omitted). "
+            f"Reads credentials from the {EMAIL_ENV_SENDER} and "
+            f"{EMAIL_ENV_APP_PASSWORD} environment variables."
+        ),
+    )
 
     args = parser.parse_args()
 
     if args.sound and not args.monitor:
         parser.error("--sound requires --monitor")
+
+    if args.email is not None and not args.monitor:
+        parser.error("--email requires --monitor")
+
+    email_sender = email_app_password = email_recipient = None
+    if args.email is not None:
+        email_sender = os.environ.get(EMAIL_ENV_SENDER)
+        email_app_password = os.environ.get(EMAIL_ENV_APP_PASSWORD)
+        if not email_sender or not email_app_password:
+            print(
+                f"Error: --email requires the {EMAIL_ENV_SENDER} and "
+                f"{EMAIL_ENV_APP_PASSWORD} environment variables to be set.\n\n"
+                f"  export {EMAIL_ENV_SENDER}=\"you@gmail.com\"\n"
+                f"  export {EMAIL_ENV_APP_PASSWORD}=\"xxxxxxxxxxxxxxxx\"\n\n"
+                f"{EMAIL_ENV_APP_PASSWORD} is a 16-character Gmail \"App Password\" "
+                "(not your regular Gmail password) - create one at "
+                "https://myaccount.google.com/apppasswords (requires 2-Step "
+                "Verification to be enabled on the account).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        email_recipient = args.email if args.email else email_sender
 
     try:
         start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
@@ -297,7 +390,16 @@ def main():
                 f"{MIN_MONITOR_INTERVAL_SECONDS}s; using {MIN_MONITOR_INTERVAL_SECONDS}s instead."
             )
             interval = MIN_MONITOR_INTERVAL_SECONDS
-        monitor_availability(args.park_id, start_date, args.nights, interval, sound=args.sound)
+        monitor_availability(
+            args.park_id,
+            start_date,
+            args.nights,
+            interval,
+            sound=args.sound,
+            email_sender=email_sender,
+            email_app_password=email_app_password,
+            email_recipient=email_recipient,
+        )
         return
 
     try:
