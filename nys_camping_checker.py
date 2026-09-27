@@ -1,5 +1,6 @@
 import argparse
 import json
+import subprocess
 import time
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -15,6 +16,8 @@ USER_AGENT = (
 REQUEST_DELAY_SECONDS = 2.5
 REQUEST_TIMEOUT_SECONDS = 15
 MAX_PAGES = 20  # safety cap; a park would need 400+ sites to exceed this
+MIN_MONITOR_INTERVAL_SECONDS = 60
+ALERT_SOUND_PATH = "/System/Library/Sounds/Glass.aiff"
 
 _last_request_time = None
 
@@ -136,8 +139,14 @@ def _booking_url(park_id, start_date, nights):
     return f"{BASE_URL.format(park_id=park_id)}?{urlencode(params)}"
 
 
-def _print_notification(result):
-    """Print a formatted alert and booking URL, and ring the terminal bell."""
+def _print_notification(result, sites=None):
+    """Print a formatted alert and booking URL, and ring the terminal bell.
+
+    Prints all of ``result["available_sites"]`` by default; pass ``sites`` to
+    alert on a specific subset instead (used by --monitor for new openings).
+    """
+    if sites is None:
+        sites = result["available_sites"]
     url = _booking_url(result["park_id"], result["start_date"], result["nights"])
     print()
     print("=" * 60)
@@ -148,12 +157,67 @@ def _print_notification(result):
         f"({result['nights']} night{'s' if result['nights'] != 1 else ''})"
     )
     print()
-    for site in result["available_sites"]:
+    for site in sites:
         print(f"  Site {site['site']}  (Loop: {site['loop']}, {site['site_type']})")
     print()
     print(f"Book here: {url}")
     print("=" * 60)
     print("\a", end="", flush=True)
+
+
+def _site_id(site):
+    """A key identifying a site, stable across checks, for new-opening tracking."""
+    return (site["loop"], site["site"])
+
+
+def _play_alert_sound():
+    """Play the macOS system alert sound, for noticing new openings from afar."""
+    try:
+        subprocess.run(["afplay", ALERT_SOUND_PATH], check=False)
+    except FileNotFoundError:
+        print("Warning: could not play alert sound (afplay not found - are you on macOS?)")
+
+
+def monitor_availability(park_id, start_date, nights, interval, sound=False):
+    """Poll check_availability() in a loop, alerting only on newly opened sites.
+
+    Runs until interrupted with Ctrl+C. Sleeps ``interval`` seconds between
+    checks; the existing per-request throttle inside check_availability()
+    still applies within each check. If ``sound`` is set, also plays the
+    macOS alert sound whenever a new opening is found.
+    """
+    print(
+        f"Monitoring park {park_id}: {start_date} for {nights} night"
+        f"{'s' if nights != 1 else ''}, checking every {interval}s. "
+        "Press Ctrl+C to stop."
+    )
+
+    seen_available = set()
+    try:
+        while True:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            try:
+                result = check_availability(park_id, start_date, nights)
+            except (ConnectionError, RuntimeError) as exc:
+                print(f"[{timestamp}] Check failed: {exc}")
+            else:
+                new_sites = [
+                    site
+                    for site in result["available_sites"]
+                    if _site_id(site) not in seen_available
+                ]
+                seen_available.update(_site_id(site) for site in result["available_sites"])
+
+                if new_sites:
+                    _print_notification(result, sites=new_sites)
+                    if sound:
+                        _play_alert_sound()
+                else:
+                    print(f"[{timestamp}] Checked — no new openings")
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nStopped monitoring.")
 
 
 def main():
@@ -186,8 +250,36 @@ def main():
             "ReserveAmerica booking URL, and ring the terminal bell"
         ),
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help=(
+            "Keep checking on a loop and alert only when a NEW site opens up "
+            "(use --interval to control how often)"
+        ),
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help=(
+            f"Seconds to wait between checks in --monitor mode (default: 300, "
+            f"minimum: {MIN_MONITOR_INTERVAL_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--sound",
+        action="store_true",
+        help=(
+            "In --monitor mode, also play the macOS alert sound on a new "
+            "opening (requires --monitor)"
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.sound and not args.monitor:
+        parser.error("--sound requires --monitor")
 
     try:
         start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
@@ -196,6 +288,17 @@ def main():
 
     if args.nights < 1:
         parser.error("--nights must be at least 1")
+
+    if args.monitor:
+        interval = args.interval
+        if interval < MIN_MONITOR_INTERVAL_SECONDS:
+            print(
+                f"Warning: --interval {interval}s is below the minimum of "
+                f"{MIN_MONITOR_INTERVAL_SECONDS}s; using {MIN_MONITOR_INTERVAL_SECONDS}s instead."
+            )
+            interval = MIN_MONITOR_INTERVAL_SECONDS
+        monitor_availability(args.park_id, start_date, args.nights, interval, sound=args.sound)
+        return
 
     try:
         result = check_availability(args.park_id, start_date, args.nights)
